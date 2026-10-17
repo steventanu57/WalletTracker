@@ -89,10 +89,6 @@ AIO_MARKUP = InlineKeyboardMarkup(
 )
 
 
-# FOR TUTORIALS
-# Store bot screaming status
-screaming = False
-
 # IMPORTANT: Handler functions MUST be starting with async
 # context.user_data is a TEMPORARY per-user dictionary, PERMANENT if using picklepersistence
 # ConversationHandler is for emabling inputs from users after a follow-up reply.
@@ -456,9 +452,7 @@ async def search_again(update: Update, context: CallbackContext) -> int:
             chat_id=query.from_user.id,  # To tell the bot which chat id to send the message to
             text="Which address's alias would you like to search for? (e.g 0xffffffffffffffffffffffffffffffffffffffff)?",
         )
-        print(
-            f"{query.from_user.first_name} is searching for top holders of another token"
-        )
+        print(f"{query.from_user.first_name} is searching for another address's alias")
         return SEARCH_ALIAS1
 
     elif choice == CANCEL_BUTTON:
@@ -501,9 +495,10 @@ async def top_holders2(update: Update, context: CallbackContext) -> int:
         token = update.message.text.upper()
         return TOP_HOLDERS1  # Retry
 
-    # Format the top 15 holders
+    # Format the top 15 holders, largest balance first (don't rely on the API's order)
+    top_holders = sorted(addresses.items(), key=lambda item: item[1], reverse=True)[:15]
     message_lines = [f"<b>Top {html.escape(token)} Holders:</b>"]
-    for i, (addr, balance) in enumerate(list(addresses.items())[:15], 1):
+    for i, (addr, balance) in enumerate(top_holders, 1):
         message_lines.append(
             f"{i}. <code>{html.escape(addr)}</code> - {balance:,.2f} {html.escape(token)}"
         )

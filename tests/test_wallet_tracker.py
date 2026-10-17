@@ -106,6 +106,21 @@ def test_start_works_while_a_question_is_open():
     )
 
 
+def test_top_holders_sorted_by_balance():
+    # API returns smallest first: the bot must still list the biggest holder as #1
+    holders = {f"0x{i:040x}": float(i) for i in range(30)}
+    run = BotRun({"holdersWithLimit/USDC/": (200, {"holders": holders})}).send(
+        "/get_top_holders", "USDC"
+    )
+    no_errors(run)
+    listing = next(
+        t for t in run.telegram.texts() if t.startswith("<b>Top USDC Holders")
+    )
+    lines = listing.splitlines()[1:]
+    assert lines[0].startswith(f"1. <code>0x{29:040x}</code> - 29.00")
+    assert lines[-1].startswith(f"15. <code>0x{15:040x}</code> - 15.00")
+
+
 def test_top_holders_failure_message():
     run = BotRun({"holdersWithLimit/": (500, None)}).send("/get_top_holders", "USDC")
     no_errors(run)
