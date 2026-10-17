@@ -11,3 +11,18 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# AI assistant / agent instruction files (personal, may contain private notes)
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+AGENTS.md
+GEMINI.md
+.cursor/
+.cursorrules
+.windsurfrules
+.github/copilot-instructions.md
+
+# Private notes: name them *.private.md or *.local.md to keep them out of git
+*.private.md
+*.local.md
