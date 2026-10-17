@@ -1,0 +1,13 @@
+# Personal settings and secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Bot data saved at runtime (contains users' saved aliases)
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
