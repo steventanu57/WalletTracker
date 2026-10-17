@@ -1,24 +1,41 @@
+import html
 import logging
 import os
 import re
+import sys
 from pathlib import Path
+from warnings import filterwarnings
 
 import aiohttp
-import asyncio
 from dotenv import load_dotenv
-from telegram import Update, ForceReply, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.constants import ParseMode
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application, ApplicationBuilder, Updater, ConversationHandler, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler,
-    PicklePersistence
+    ApplicationBuilder,
+    CallbackContext,
+    CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    PicklePersistence,
+    filters,
 )
+from telegram.warnings import PTBUserWarning
 
+# per_message=False is intended: the buttons belong to the user's conversation, not to one message
+filterwarnings(action="ignore", message=r".*CallbackQueryHandler", category=PTBUserWarning)
 
 logger = logging.getLogger(__name__)
 
 # Personal settings are read from .env (copy .env.example to .env and fill it in)
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
+
+# Names with emoji would crash print() when output goes to a log file on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
+ADDRESS_RE = re.compile(r"0x[0-9a-f]{40}")  # Hyperliquid addresses: 0x + 40 hex characters
 
 # Conversation states
 START_BUTTON_TAPS = 0
@@ -69,6 +86,16 @@ screaming = False
 # context.user_data is a TEMPORARY per-user dictionary, PERMANENT if using picklepersistence
 # ConversationHandler is for emabling inputs from users after a follow-up reply.
 
+async def fetch_json(url):
+    """Returns (status, data). status is None when Hypurrscan can't be reached."""
+    try:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session, session.get(url) as response:
+            if response.status != 200:
+                return response.status, None
+            return response.status, await response.json()
+    except (aiohttp.ClientError, TimeoutError):
+        return None, None
+
 # Main handler functions
 # Make the /start display all the buttons in a compact table
 async def start(update: Update, context: CallbackContext) -> int:
@@ -90,10 +117,9 @@ async def start_button_taps(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
     choice = query.data
-    markup = None # Initializes the markup depending on the conversation state, IF any
 
     # If checks for conversation states
-    if choice == START_REGISTER_ALIAS: 
+    if choice == START_REGISTER_ALIAS:
         return await register_alias1(update, context)  # Call function immediately
     elif choice == START_REMOVE_ALIAS:
         return await remove_alias1(update, context)
@@ -117,7 +143,7 @@ async def register_alias1(update: Update, context: CallbackContext) -> int:
     if aliases:
         message_lines = ["<b>Registered aliases: </b>"]
         for alias, address in aliases.items():
-            message_lines.append(f"{address} -> {alias}")
+            message_lines.append(f"{html.escape(address)} -> {html.escape(alias)}")
         await message.reply_text("\n".join(message_lines), parse_mode="HTML")
     
     await message.reply_text("Please enter a valid address to be added to the list of aliases (e.g 0xffffffffffffffffffffffffffffffffffffffff)")
@@ -128,14 +154,13 @@ async def register_alias1(update: Update, context: CallbackContext) -> int:
 async def register_alias2(update: Update, context: CallbackContext) -> int:
     address = update.message.text.strip().lower()
 
-    url = f"https://hypurrscan.io/address/{address}"
     print(f"{update.message.from_user.first_name} is appending {address}")
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                await update.message.reply_text("❌ Failed to search for wallet address!")
-                return ConversationHandler.END
+    if not ADDRESS_RE.fullmatch(address):
+        await update.message.reply_text(
+            "❌ That is not a valid address. It should be 0x followed by 40 characters (0-9, a-f).\nPlease try again"
+        )
+        return REGISTER_ALIAS1
 
     context.user_data["address"] = address # A temporary dictionary to be able to access this address in register_alias3
     print(f"{update.message.from_user.first_name} successfully appended {address}")
@@ -147,13 +172,13 @@ async def register_alias2(update: Update, context: CallbackContext) -> int:
 async def register_alias3(update: Update, context: CallbackContext) -> int:
     alias = update.message.text.strip().lower()
 
-    address = context.user_data.get("address")
-
     if not alias:
         await update.message.reply_text("❌ Try again. Please type a proper alias")
         print(f"{update.message.from_user.first_name} did not type a proper alias")
         return REGISTER_ALIAS2
-    
+
+    address = context.user_data.pop("address") # pop so the temporary address isn't saved forever
+
     if "aliases" not in context.user_data:
         context.user_data["aliases"] = {}
     context.user_data["aliases"][alias] = address
@@ -164,7 +189,7 @@ async def register_alias3(update: Update, context: CallbackContext) -> int:
     aliases = context.user_data.get("aliases", {})
     message_lines = ["<b>Registered aliases: </b>"]
     for alias, address in aliases.items():
-        message_lines.append(f"{address} -> {alias}")
+        message_lines.append(f"{html.escape(address)} -> {html.escape(alias)}")
     await update.message.reply_text("\n".join(message_lines), parse_mode="HTML")
 
     await update.message.reply_text(
@@ -185,7 +210,7 @@ async def register_again(update: Update, context: CallbackContext) -> int:
         aliases = context.user_data.get("aliases", {})
         message_lines = ["<b>Registered aliases:</b>"]
         for alias, address in aliases.items():
-            message_lines.append(f"{address} -> {alias}")
+            message_lines.append(f"{html.escape(address)} -> {html.escape(alias)}")
 
         await query.edit_message_text("\n".join(message_lines), parse_mode="HTML")
         await context.bot.send_message( # Can't use update.message.reply_text since it is from a query
@@ -218,7 +243,7 @@ async def remove_alias1(update:Update, context: CallbackContext) -> int:
     message_lines = ["<b>Registered aliases:</b>"]
     aliases = context.user_data.get("aliases", {})
     for alias, address in aliases.items():
-        message_lines.append(f"{address} -> {alias}")
+        message_lines.append(f"{html.escape(address)} -> {html.escape(alias)}")
     await message.reply_text("\n".join(message_lines), parse_mode="HTML")
 
     await message.reply_text("Which alias would you like to remove?\nPlease type the alias")
@@ -242,7 +267,7 @@ async def remove_alias2(update: Update, context: CallbackContext) -> int:
     message_lines = ["<b>Registered aliases: </b>"]
     aliases = context.user_data.get("aliases", {})
     for alias, address in aliases.items():
-        message_lines.append(f"{address} -> {alias}")
+        message_lines.append(f"{html.escape(address)} -> {html.escape(alias)}")
     await update.message.reply_text("\n".join(message_lines), parse_mode="HTML")  
 
     alias = update.message.text.strip().lower()
@@ -263,12 +288,12 @@ async def remove_again_choice(update: Update, context: CallbackContext) -> int:
         aliases = context.user_data.get("aliases", {})
         if not aliases:
             await query.edit_message_text("❌ No more aliases left to remove.") # query.edit_message_text EDITS text, instead of sending a new text
-            print(f"{update.message.from_user.first_name} has no more aliases left to remove")
+            print(f"{query.from_user.first_name} has no more aliases left to remove")
             return ConversationHandler.END
 
         message_lines = ["<b>Registered aliases: </b>"]
         for alias, address in aliases.items():
-            message_lines.append(f"{address} -> {alias}")
+            message_lines.append(f"{html.escape(address)} -> {html.escape(alias)}")
 
         await query.edit_message_text("\n".join(message_lines), parse_mode="HTML")
         await context.bot.send_message(
@@ -294,7 +319,7 @@ async def view_aliases(update: Update, context: CallbackContext):
     elif message == update.callback_query.message:
         method = update.callback_query
 
-    if not context.user_data["aliases"]:
+    if not context.user_data.get("aliases"):
         await message.reply_text("❌ Please register an alias first")
         print(f"{message.from_user.first_name} failed to view registered aliases")
         return ConversationHandler.END
@@ -302,7 +327,7 @@ async def view_aliases(update: Update, context: CallbackContext):
     message_lines = ["<b>Registered aliases: </b>"]
     aliases = context.user_data.get("aliases", {})
     for alias, address in aliases.items():
-        message_lines.append(f"{address} -> {alias}")
+        message_lines.append(f"{html.escape(address)} -> {html.escape(alias)}")
     
     await message.reply_text("\n".join(message_lines), parse_mode="HTML")
     print(f"{method.from_user.first_name} is viewing registered aliases")
@@ -314,12 +339,10 @@ async def get_global_aliases(update: Update, context: CallbackContext) -> None:
 
     url = "https://api.hypurrscan.io/globalAliases"
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                await message.reply_text("❌ Failed to fetch global aliases.")
-                return
-            data = await response.json()
+    status, data = await fetch_json(url)
+    if status != 200:
+        await message.reply_text("❌ Failed to fetch global aliases.")
+        return
 
     if not data:
         await message.reply_text("❌ No aliases found.")
@@ -328,7 +351,7 @@ async def get_global_aliases(update: Update, context: CallbackContext) -> None:
     # Format the message
     message_lines = ["<b>Global Wallet Aliases:</b>"]
     for addr, label in list(data.items())[:30]:  # show only top 30 for readability
-        message_lines.append(f"<code>{addr}</code>: {label}")
+        message_lines.append(f"<code>{html.escape(addr)}</code>: {html.escape(label)}")
 
     await message.reply_text("\n".join(message_lines), parse_mode="HTML")
     return ConversationHandler.END
@@ -348,12 +371,10 @@ async def search_alias2(update: Update, context: CallbackContext) -> int:
     url = "https://api.hypurrscan.io/globalAliases"
     print(f"{update.message.from_user.first_name} is searching for alias of {address}")
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                await update.message.reply_text("❌ Failed to fetch global alias for this address")
-                return ConversationHandler.END
-            data = await response.json()
+    status, data = await fetch_json(url)
+    if status != 200:
+        await update.message.reply_text("❌ Failed to fetch global alias for this address")
+        return ConversationHandler.END
 
     alias = data.get(address)
     
@@ -362,8 +383,8 @@ async def search_alias2(update: Update, context: CallbackContext) -> int:
         print(f'Could not find alias for {address}')
         return SEARCH_ALIAS1
     
-    message_lines = [f"✅ <b>Search successful!</b>\n<b>Address</b>: {address}"]
-    message_lines.append(f"<b>Alias</b>: {alias}")
+    message_lines = [f"✅ <b>Search successful!</b>\n<b>Address</b>: {html.escape(address)}"]
+    message_lines.append(f"<b>Alias</b>: {html.escape(alias)}")
     message_lines.append("Would you like to search for another address's alias?")
     
     await update.message.reply_text("\n".join(message_lines), parse_mode="HTML", reply_markup=ASK_MARKUP)
@@ -404,25 +425,22 @@ async def top_holders2(update: Update, context: CallbackContext) -> int:
     url = f"https://api.hypurrscan.io/holdersWithLimit/{token}/1000"
     print(f'{update.message.from_user.first_name} is searching for top holders of {token}')
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                await update.message.reply_text("❌ Failed to fetch global aliases.")
-                return ConversationHandler.END
-            data = await response.json()
+    status, data = await fetch_json(url)
+    if status != 200:
+        await update.message.reply_text("❌ Failed to fetch top holders.")
+        return ConversationHandler.END
 
     addresses = data.get("holders", {})
     if not addresses:
         await update.message.reply_text("❌ No holder data available. Please try again")
         print(f'Could not find holder data for {token}')
-        #
         token = update.message.text.upper()
         return TOP_HOLDERS1 # Retry
     
     # Format the top 15 holders
-    message_lines = [f"<b>Top {token} Holders:</b>"]
+    message_lines = [f"<b>Top {html.escape(token)} Holders:</b>"]
     for i, (addr, balance) in enumerate(list(addresses.items())[:15],1):
-        message_lines.append(f"{i}. <code>{addr}</code> - {balance:,.2f} {token}")
+        message_lines.append(f"{i}. <code>{html.escape(addr)}</code> - {balance:,.2f} {html.escape(token)}")
     
     # When done with everything,
     await update.message.reply_text("\n".join(message_lines), parse_mode="HTML")
@@ -476,9 +494,6 @@ async def console(update: Update, context: CallbackContext) -> None:
     """
     This function would be added to the dispatcher as a handler for messages coming from the Bot API
     """
-    user_id = update.message.from_user.id
-    text = update.message.text
-
     # Print to console
     print(f'{update.message.from_user.first_name} wrote {update.message.text}')
 
@@ -488,7 +503,8 @@ def main() -> None:
     if not bot_token:
         raise SystemExit("Missing BOT_TOKEN in .env (see .env.example)")
 
-    persistence = PicklePersistence(filepath=BASE_DIR / "bot_data.pkl")
+    # Save changed data every 5 seconds (default 60), so a crash or closed window loses at most 5 seconds
+    persistence = PicklePersistence(filepath=BASE_DIR / "bot_data.pkl", update_interval=5)
     app = ApplicationBuilder().token(bot_token).persistence(persistence).build()
 
 
@@ -500,6 +516,9 @@ def main() -> None:
     # entry_points: Starting the function with an input and returns an int 
     # states: Depending on the returned int from entry_points, the MessageHandler will do according filter checks and functions
     # fallbacks: A list of handlers for unexpected input or early exits, like /cancel
+    # Only new text messages: edited messages have no update.message and would crash the handlers
+    text_reply = filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND
+
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("get_top_holders", top_holders1), # /get_top_holders
@@ -515,24 +534,25 @@ def main() -> None:
             # filters.TEXT & ~filters.COMMAND = “Only match plain text messages that are not commands.”
             START_BUTTON_TAPS: [CallbackQueryHandler(start_button_taps)],
 
-            TOP_HOLDERS1: [MessageHandler(filters.TEXT & ~filters.COMMAND, top_holders2)],
-            SEARCH_ALIAS1: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_alias2)],
-            REGISTER_ALIAS1: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_alias2)],
-            REGISTER_ALIAS2: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_alias3)],
-            REMOVE_ALIAS1: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_alias2)],
+            TOP_HOLDERS1: [MessageHandler(text_reply, top_holders2)],
+            SEARCH_ALIAS1: [MessageHandler(text_reply, search_alias2)],
+            REGISTER_ALIAS1: [MessageHandler(text_reply, register_alias2)],
+            REGISTER_ALIAS2: [MessageHandler(text_reply, register_alias3)],
+            REMOVE_ALIAS1: [MessageHandler(text_reply, remove_alias2)],
 
             REMOVE_AGAIN: [CallbackQueryHandler(remove_again_choice)],
             REGISTER_AGAIN: [CallbackQueryHandler(register_again)],
             SHOW_TOP_HOLDERS_AGAIN: [CallbackQueryHandler(show_top_holders_again)],
             SEARCH_AGAIN: [CallbackQueryHandler(search_again)]
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True # A command typed mid-question restarts instead of being silently ignored
     )
 
     app.add_handler(conv_handler)
 
     # This is for all messages, it will just echo it back to you through the terminal
-    app.add_handler(MessageHandler(~filters.COMMAND, console))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, console))
 
     # Start the Bot
     app.run_polling()

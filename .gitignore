@@ -11,6 +11,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
 
 # AI assistant / agent instruction files (personal, may contain private notes)
 CLAUDE.md

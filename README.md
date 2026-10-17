@@ -21,7 +21,7 @@ Each user's saved names are kept in `bot_data.pkl`, so they survive restarts.
 
 ## Setup
 
-1. Install Python 3.12 and the dependencies:
+1. Install Python 3.12 or 3.13 and the dependencies:
 
    ```
    pip install -r requirements.txt
@@ -43,7 +43,7 @@ To list the commands under Telegram's **Menu** button, send `/setcommands` to @B
 
 ## Notes
 
-Wallet data comes from Hypurrscan's public API. This project is not affiliated with Hyperliquid or Hypurrscan.
+Wallet data comes from Hypurrscan's public API. This project is not affiliated with Hyperliquid or Hypurrscan. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the bot works and how to run the tests.
 
 ## License
 
