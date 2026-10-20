@@ -9,15 +9,18 @@ Built with [python-telegram-bot](https://python-telegram-bot.org/).
 | Command | What it does |
 |---|---|
 | `/start` | Shows every feature as a button |
-| `/register_alias` | Save a name for a wallet address (your personal address book) |
-| `/remove_alias` | Remove a saved name |
+| `/register_alias` | Save a name for a wallet address (your personal address book). Reusing a name asks before replacing its address |
+| `/remove_alias` | Remove a saved name: tap it, or type it |
 | `/view_aliases` | List your saved names |
-| `/search_alias` | Look up the public Hypurrscan name of an address |
-| `/get_global_aliases` | Show the first 30 public names on Hypurrscan |
-| `/get_top_holders` | Show the top 15 holders of a token, e.g. USDC |
-| `/cancel` | Leave the current step |
+| `/search_alias` | Send an address to get its public Hypurrscan name, or part of a name (e.g. HyperEVM) to find its addresses |
+| `/get_global_aliases` | Browse all public names on Hypurrscan, 30 per page |
+| `/get_top_holders` | Show the top holders of a token, e.g. USDC, 15 per page, with your own names, public names and Hyperliquid system addresses marked |
+| `/help` | List the commands |
+| `/cancel` | Leave the current step (every question also has a **Cancel** button) |
 
-Each user's saved names are kept in `bot_data.pkl`, so they survive restarts.
+- Addresses are tap-to-copy, and **view** opens the address on Hypurrscan.
+- Your saved names keep their capitals; finding or removing one ignores case.
+- Each user's saved names are kept in `bot_data.pkl`, so they survive restarts.
 
 ## Setup
 
@@ -35,7 +38,7 @@ Each user's saved names are kept in `bot_data.pkl`, so they survive restarts.
    python wallet_tracker.py
    ```
 
-To list the commands under Telegram's **Menu** button, send `/setcommands` to @BotFather and paste the commands from the table above.
+The bot fills Telegram's **Menu** button with its commands every time it starts, so there's no need to set them in @BotFather.
 
 ## Keep these private
 

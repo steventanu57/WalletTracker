@@ -4,6 +4,7 @@ fake Hypurrscan, so tests need no network, no bot token and no real data.
 Set WT_DIR to test a copy of wallet_tracker.py somewhere else (default: the repo root)."""
 
 import asyncio
+import html
 import importlib.util
 import json
 import os
@@ -48,6 +49,14 @@ def telegram_accepts_html(text):
     return not opened
 
 
+def visible_length(params):
+    # Telegram counts the limit after HTML is turned into formatting: tags and link targets don't count
+    text = params["text"]
+    if params.get("parse_mode") == "HTML":
+        text = html.unescape(TAG_RE.sub("", text))
+    return len(text)
+
+
 class FakeTelegram(BaseRequest):
     """Answers Bot API calls locally and records every message the bot tries to send."""
 
@@ -80,6 +89,14 @@ class FakeTelegram(BaseRequest):
         if endpoint == "getMe":
             result = BOT
         elif endpoint in ("sendMessage", "editMessageText"):
+            if visible_length(params) > 4096:  # Telegram's limit
+                return 400, json.dumps(
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: message is too long",
+                    }
+                ).encode()
             if params.get("parse_mode") == "HTML" and not telegram_accepts_html(
                 params["text"]
             ):
@@ -107,14 +124,24 @@ class FakeTelegram(BaseRequest):
             p["text"] for e, p in self.calls if e in ("sendMessage", "editMessageText")
         ]
 
+    def count(self, endpoint):
+        return sum(1 for e, _ in self.calls if e == endpoint)
+
 
 class FakeHypurrscan:
-    """Stands in for aiohttp.ClientSession. routes: {url_substring: (status, json) or Exception}."""
+    """Stands in for aiohttp.ClientSession. routes: {url_substring: (status, json) or Exception}.
+    requested lists every URL asked for; opened counts the sessions (connections) created."""
 
     routes: ClassVar[dict] = {}
+    requested: ClassVar[list] = []
+    opened: ClassVar[int] = 0
+    closed = False  # The bot reuses one session while it's open
 
     def __init__(self, *a, **k):
-        pass
+        FakeHypurrscan.opened += 1
+
+    async def close(self):
+        self.closed = True
 
     async def __aenter__(self):
         return self
@@ -123,6 +150,7 @@ class FakeHypurrscan:
         return False
 
     def get(self, url, *a, **k):
+        self.requested.append(url)
         for key, answer in self.routes.items():
             if key in url:
                 if isinstance(answer, Exception):
@@ -168,6 +196,8 @@ class BotRun:
         self.errors = []
         self._update_id = 0
         FakeHypurrscan.routes = hypurrscan_routes or {}
+        FakeHypurrscan.requested = []
+        FakeHypurrscan.opened = 0
         self.module = load_bot_module()
         self.app = self._build()
         if saved_user_data:
@@ -285,6 +315,17 @@ class BotRun:
                         }
                     await self.app.process_update(Update.de_json(upd, self.app.bot))
                 await self.app.shutdown()
+
+        asyncio.run(go())
+        return self
+
+    def call(self, func):
+        """Runs func(app) with the app started, e.g. the bot's post_init."""
+
+        async def go():
+            await self.app.initialize()
+            await func(self.app)
+            await self.app.shutdown()
 
         asyncio.run(go())
         return self
