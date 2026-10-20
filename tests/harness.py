@@ -1,5 +1,5 @@
 """Runs the real wallet_tracker.py handlers end to end against a fake Telegram server and a
-fake Hypurrscan, so tests need no network, no bot token and no real data.
+fake Hypurrscan / Hyperliquid, so tests need no network, no bot token and no real data.
 
 Set WT_DIR to test a copy of wallet_tracker.py somewhere else (default: the repo root)."""
 
@@ -25,6 +25,7 @@ os.environ["BOT_TOKEN"] = "123456:zz-fake-token"
 BOT = {"id": 999, "is_bot": True, "first_name": "zz-bot", "username": "zz_bot"}
 USER = {"id": 111, "is_bot": False, "first_name": "zz-User"}
 CHAT = {"id": 111, "type": "private", "first_name": "zz-User"}
+GROUP = {"id": -100555, "type": "supergroup", "title": "zz-Group"}
 
 # Telegram's HTML mode (https://core.telegram.org/bots/api#html-style) supports only these tags.
 # A "<" that doesn't start one of them, or unbalanced tags, makes Telegram reject the message.
@@ -62,6 +63,8 @@ class FakeTelegram(BaseRequest):
 
     def __init__(self):
         self.calls, self._next_id = [], 5000
+        self.files = {}  # file_id -> bytes, for files "sent" by the test user
+        self.documents = []  # (filename, bytes) of every file the bot sent
 
     @property
     def read_timeout(self):
@@ -83,11 +86,36 @@ class FakeTelegram(BaseRequest):
         connect_timeout=None,
         pool_timeout=None,
     ):
+        if "/file/bot" in url:  # Downloading a file the test user sent
+            return 200, self.files[url.rsplit("/", 1)[-1]]
         endpoint = url.rsplit("/", 1)[-1]
         params = request_data.parameters if request_data else {}
         self.calls.append((endpoint, params))
         if endpoint == "getMe":
             result = BOT
+        elif endpoint == "getFile":
+            result = {
+                "file_id": params["file_id"],
+                "file_unique_id": "zz-u",
+                "file_size": len(self.files[params["file_id"]]),
+                "file_path": f"documents/{params['file_id']}",
+            }
+        elif endpoint == "sendDocument":
+            filename, content, _ = request_data.multipart_data["document"]
+            content = content if isinstance(content, bytes) else content.read()
+            self.documents.append((filename, content))
+            self._next_id += 1
+            result = {
+                "message_id": self._next_id,
+                "date": 0,
+                "chat": CHAT,
+                "from": BOT,
+                "document": {
+                    "file_id": "zz-sent",
+                    "file_unique_id": "zz-sent-u",
+                    "file_name": filename,
+                },
+            }
         elif endpoint in ("sendMessage", "editMessageText"):
             if visible_length(params) > 4096:  # Telegram's limit
                 return 400, json.dumps(
@@ -129,11 +157,15 @@ class FakeTelegram(BaseRequest):
 
 
 class FakeHypurrscan:
-    """Stands in for aiohttp.ClientSession. routes: {url_substring: (status, json) or Exception}.
-    requested lists every URL asked for; opened counts the sessions (connections) created."""
+    """Stands in for aiohttp.ClientSession (Hypurrscan and Hyperliquid).
+    routes: {url_substring: answer} for GET requests, and {"info:<type>": answer} for
+    Hyperliquid's POST requests (by the body's "type"). An answer is (status, json), an
+    Exception, or a function(body) that returns one of those.
+    requested lists every request; bodies the POST bodies; opened counts the sessions created."""
 
     routes: ClassVar[dict] = {}
     requested: ClassVar[list] = []
+    bodies: ClassVar[list] = []
     opened: ClassVar[int] = 0
     closed = False  # The bot reuses one session while it's open
 
@@ -152,11 +184,25 @@ class FakeHypurrscan:
     def get(self, url, *a, **k):
         self.requested.append(url)
         for key, answer in self.routes.items():
-            if key in url:
-                if isinstance(answer, Exception):
-                    raise answer
-                return _Response(*answer)
+            if not key.startswith("info:") and key in url:
+                return _answer(answer, None)
         raise AssertionError(f"unexpected URL {url}")
+
+    def post(self, url, *a, json=None, **k):
+        kind = (json or {}).get("type")
+        self.requested.append(f"POST {url} {kind}")
+        self.bodies.append(json)
+        if f"info:{kind}" in self.routes:
+            return _answer(self.routes[f"info:{kind}"], json)
+        raise AssertionError(f"unexpected Hyperliquid request {json}")
+
+
+def _answer(answer, body):
+    if callable(answer) and not isinstance(answer, Exception):
+        answer = answer(body)
+    if isinstance(answer, Exception):
+        raise answer
+    return _Response(*answer)
 
 
 class _Response:
@@ -186,17 +232,27 @@ def load_bot_module():
 class BotRun:
     """Builds the app exactly as the bot's own main() does, but wired to the fakes."""
 
-    def __init__(self, hypurrscan_routes=None, saved_user_data=None):
+    def __init__(
+        self,
+        hypurrscan_routes=None,
+        saved_user_data=None,
+        chat=None,
+        no_job_queue=False,
+    ):
+        # no_job_queue=True: build the app the way python-telegram-bot does when APScheduler isn't installed
         # Deleted automatically once the run is no longer used (at the latest when Python exits)
         self._tmp = tempfile.TemporaryDirectory(
             prefix="zz-wt-", ignore_cleanup_errors=True
         )
         self.tmp = Path(self._tmp.name)
         self.telegram = FakeTelegram()
+        self.chat = chat or CHAT  # GROUP to talk to the bot from a group chat
+        self.no_job_queue = no_job_queue
         self.errors = []
         self._update_id = 0
         FakeHypurrscan.routes = hypurrscan_routes or {}
         FakeHypurrscan.requested = []
+        FakeHypurrscan.bodies = []
         FakeHypurrscan.opened = 0
         self.module = load_bot_module()
         self.app = self._build()
@@ -206,7 +262,7 @@ class BotRun:
     def _build(self):
         captured = {}
         real_builder = self.module.ApplicationBuilder
-        fake_tg, tmp = self.telegram, self.tmp
+        fake_tg, tmp, no_job_queue = self.telegram, self.tmp, self.no_job_queue
 
         class Builder:
             def __init__(self):
@@ -226,6 +282,8 @@ class BotRun:
                 return self
 
             def build(self):
+                if no_job_queue:
+                    self.b = self.b.job_queue(None)
                 return self.b.build()
 
         with (
@@ -245,6 +303,12 @@ class BotRun:
 
         app.add_error_handler(record)
         return app
+
+    def restart(self):
+        """Like stopping and starting the bot again: a fresh copy of the code and app, same saved data."""
+        self.module = load_bot_module()
+        self.app = self._build()
+        return self
 
     async def _seed(self, saved_user_data):
         # Write a complete pickle file first; the app loads it in initialize()
@@ -266,7 +330,7 @@ class BotRun:
         msg = {
             "message_id": self._next(),
             "date": 0,
-            "chat": CHAT,
+            "chat": self.chat,
             "from": USER,
             "text": text,
         }
@@ -277,7 +341,8 @@ class BotRun:
         return msg
 
     def send(self, *steps):
-        """steps: plain text / commands, ("tap", button_text) or ("edit", text)."""
+        """steps: plain text / commands, ("tap", button_data), ("edit", text)
+        or ("document", filename, bytes)."""
 
         async def go():
             with mock.patch.object(aiohttp, "ClientSession", FakeHypurrscan):
@@ -294,7 +359,7 @@ class BotRun:
                                 "message": {
                                     "message_id": 4000,
                                     "date": 0,
-                                    "chat": CHAT,
+                                    "chat": self.chat,
                                     "from": BOT,
                                     "text": "zz",
                                 },
@@ -308,6 +373,19 @@ class BotRun:
                                 "edit_date": 1,
                             },
                         }
+                    elif isinstance(step, tuple) and step[0] == "document":
+                        _, filename, content = step
+                        file_id = f"zz-file{self._update_id}"
+                        self.telegram.files[file_id] = content
+                        msg = self._message("")
+                        del msg["text"]
+                        msg["document"] = {
+                            "file_id": file_id,
+                            "file_unique_id": f"{file_id}-u",
+                            "file_name": filename,
+                            "file_size": len(content),
+                        }
+                        upd = {"update_id": self._next(), "message": msg}
                     else:
                         upd = {
                             "update_id": self._next(),
@@ -323,12 +401,25 @@ class BotRun:
         """Runs func(app) with the app started, e.g. the bot's post_init."""
 
         async def go():
-            await self.app.initialize()
-            await func(self.app)
-            await self.app.shutdown()
+            with mock.patch.object(aiohttp, "ClientSession", FakeHypurrscan):
+                await self.app.initialize()
+                await func(self.app)
+                await self.app.shutdown()
 
         asyncio.run(go())
         return self
+
+    def run_jobs(self, name):
+        """Runs the scheduled jobs with this name now (e.g. "alerts:111"), as if their time had come."""
+
+        async def go(app):
+            for job in app.job_queue.get_jobs_by_name(name):
+                await job.run(app)
+
+        return self.call(go)
+
+    def jobs(self, name):
+        return self.app.job_queue.get_jobs_by_name(name)
 
     def saved_user_data(self):
         async def read():

@@ -2,24 +2,23 @@
 Test data uses the zz- prefix."""
 
 import contextlib
+import csv
 import io
 import os
 import re
 import subprocess
 import sys
+import time
 import warnings
 from unittest import mock
 
 import aiohttp
-from harness import BotRun, FakeHypurrscan, bot_dir
+from harness import GROUP, BotRun, FakeHypurrscan, bot_dir
 from telegram.warnings import PTBUserWarning
 
 ADDR = "0x" + "ab" * 20  # a well-formed 42-character address
 ADDR2 = "0x" + "cd" * 20
 ALIASES_URL = "api.hypurrscan.io/globalAliases"
-ADDRESS_PAGE = (
-    "hypurrscan.io/address/"  # returns HTTP 200 for ANY text, so it can't validate
-)
 
 
 def no_errors(run):
@@ -32,11 +31,11 @@ def no_errors(run):
 def test_start_shows_menu():
     run = BotRun().send("/start")
     no_errors(run)
-    assert "Welcome to <b>Hyperliquid Wallet Storage</b>" in run.telegram.texts()[0]
+    assert "Welcome to <b>Hyperliquid Wallet Tracker</b>" in run.telegram.texts()[0]
 
 
 def test_register_valid_address_is_saved():
-    run = BotRun({ADDRESS_PAGE: (200, None)}).send("/register_alias", ADDR, "zz-main")
+    run = BotRun().send("/register_alias", ADDR, "zz-main")
     no_errors(run)
     assert run.saved_user_data()["aliases"] == {"zz-main": ADDR}
 
@@ -78,17 +77,13 @@ def test_remove_last_alias_then_continue():
 
 
 def test_garbage_address_is_rejected():
-    run = BotRun({ADDRESS_PAGE: (200, None)}).send(
-        "/register_alias", "zz-not-an-address", "zz-name"
-    )
+    run = BotRun().send("/register_alias", "zz-not-an-address", "zz-name")
     no_errors(run)
     assert "aliases" not in run.saved_user_data(), "garbage address was saved"
 
 
 def test_alias_with_html_characters_still_gets_listed():
-    run = BotRun({ADDRESS_PAGE: (200, None)}).send(
-        "/register_alias", ADDR, "zz-<me&you>"
-    )
+    run = BotRun().send("/register_alias", ADDR, "zz-<me&you>")
     no_errors(run)
     assert any("Registered aliases" in t for t in run.telegram.texts())
 
@@ -143,7 +138,7 @@ def test_network_error_gets_a_reply():
 
 
 def test_no_leftover_temporary_address_in_saved_data():
-    run = BotRun({ADDRESS_PAGE: (200, None)}).send("/register_alias", ADDR, "zz-main")
+    run = BotRun().send("/register_alias", ADDR, "zz-main")
     no_errors(run)
     assert "address" not in run.saved_user_data()
 
@@ -459,3 +454,415 @@ def test_pages_fit_in_one_message_even_with_very_long_names():  # W8, W16
         saved_user_data={"aliases": mine},
     ).send("/get_top_holders", "USDC")
     no_errors(run)
+
+
+# ---------- phase 2: timeouts, saved questions, wallets, alerts, alias tools, groups ----------
+WALLET = "0x" + "ef" * 20
+PERPS = {
+    "time": 1792492882000,
+    "marginSummary": {"accountValue": "12345.678"},
+    "withdrawable": "100.5",
+    "assetPositions": [
+        {
+            "type": "oneWay",
+            "position": {
+                "coin": "BTC",
+                "szi": "-0.5",
+                "entryPx": "78018.6",
+                "positionValue": "39000.0",
+                "unrealizedPnl": "-120.25",
+                "returnOnEquity": "-0.0312",
+                "leverage": {"type": "cross", "value": 5},
+                "liquidationPx": "146670.9456",
+            },
+        }
+    ],
+}
+SPOT = {
+    "balances": [
+        {"coin": "USDC", "total": "250.5"},
+        {"coin": "HYPE", "total": "12.3456789"},
+        {"coin": "PURR", "total": "0.0"},
+    ]
+}
+WALLET_ROUTES = {
+    "info:clearinghouseState": (200, PERPS),
+    "info:spotClearinghouseState": (200, SPOT),
+}
+SPOT_META = {
+    "universe": [{"name": "@107", "tokens": [150, 0], "index": 107}],
+    "tokens": [{"name": "USDC", "index": 0}, {"name": "HYPE", "index": 150}],
+}
+LATER = 10_000_000.0  # A fixed "now" for alert tests (seconds)
+
+
+def fill(tid, coin, side, size, px, start, pnl="0.0", time_ms=2000):
+    return {
+        "tid": tid,
+        "coin": coin,
+        "side": side,
+        "sz": size,
+        "px": px,
+        "startPosition": start,
+        "closedPnl": pnl,
+        "time": time_ms,
+        "dir": "zz",
+    }
+
+
+def alerts_on(**extra):
+    # Saved data of a user with alerts on for WALLET since time 1000 (ms)
+    return {
+        "aliases": {"zz-whale": WALLET},
+        "alert_wallets": {WALLET: 1000},
+        "alert_every": 3600,
+        **extra,
+    }
+
+
+def started(run):
+    return run.call(run.app.post_init)  # Like starting the bot: post_init runs
+
+
+def check_now(run, routes):
+    FakeHypurrscan.routes = routes
+    with mock.patch.object(run.module, "now", lambda: LATER):
+        run.run_jobs("alerts:111")
+    return run
+
+
+def sent_text(run):
+    return "\n".join(run.telegram.texts())
+
+
+def test_late_answer_is_not_taken():  # W3
+    run = BotRun({HOLDERS: (200, {"holders": {ADDR: 1.0}}), ALIASES_URL: (200, {})})
+    run.send("/get_top_holders")
+    with mock.patch.object(run.module, "now", lambda: time.time() + 601):
+        run.send("zz-hi how are you")
+    no_errors(run)
+    assert run.telegram.texts()[-1].startswith("⌛")
+    assert not [u for u in FakeHypurrscan.requested if HOLDERS in u]
+
+
+def test_answer_in_time_is_taken():  # W3
+    run = BotRun({HOLDERS: (200, {"holders": {ADDR: 1.0}}), ALIASES_URL: (200, {})})
+    run.send("/get_top_holders")
+    with mock.patch.object(run.module, "now", lambda: time.time() + 500):
+        run.send("USDC")
+    no_errors(run)
+    assert any(t.startswith("<b>Top USDC Holders") for t in run.telegram.texts())
+
+
+def test_open_question_survives_a_restart():  # W27
+    run = BotRun({HOLDERS: (200, {"holders": {ADDR: 1.0}}), ALIASES_URL: (200, {})})
+    run.send("/get_top_holders").restart().send("USDC")
+    no_errors(run)
+    assert any(t.startswith("<b>Top USDC Holders") for t in run.telegram.texts())
+
+
+def test_late_answer_after_a_restart_is_not_taken():  # W3 + W27
+    run = BotRun({HOLDERS: (200, {"holders": {ADDR: 1.0}}), ALIASES_URL: (200, {})})
+    run.send("/get_top_holders").restart()
+    with mock.patch.object(run.module, "now", lambda: time.time() + 601):
+        run.send("USDC")
+    no_errors(run)
+    assert run.telegram.texts()[-1].startswith("⌛")
+
+
+def test_wallet_shows_positions_and_balances():  # W28
+    run = BotRun(WALLET_ROUTES, saved_user_data={"aliases": {"zz-whale": WALLET}})
+    run.send("/wallet zz-whale")
+    no_errors(run)
+    text = sent_text(run)
+    for expected in [
+        "zz-whale",
+        "SHORT 0.5 @ 78,018.6",
+        "account value $12,345.68",
+        "uPnL -$120.25 (-3.1%)",
+        "5x cross",
+        "liq 146,671",
+        "<b>USDC</b> 250.5",
+        "<b>HYPE</b> 12.3457",
+    ]:
+        assert expected in text, expected
+    assert "PURR" not in text  # Empty balances aren't listed
+    assert {"type": "clearinghouseState", "user": WALLET} in FakeHypurrscan.bodies
+
+
+def test_wallet_can_be_picked_typed_or_tapped():  # W28
+    run = BotRun(WALLET_ROUTES, saved_user_data={"aliases": {"zz-whale": WALLET}})
+    run.send("/wallet", ("tap", run.module.button_data("w", "zz-whale")))
+    no_errors(run)
+    assert "SHORT 0.5" in sent_text(run)
+    run = BotRun(WALLET_ROUTES).send("/wallet", WALLET.upper().replace("0X", "0x"))
+    no_errors(run)
+    assert "SHORT 0.5" in sent_text(run)
+
+
+def test_wallet_unknown_name_is_asked_again():  # W28
+    run = BotRun(WALLET_ROUTES).send("/wallet zz-nobody")
+    no_errors(run)
+    assert "No saved alias or address matches" in run.telegram.texts()[-1]
+
+
+def test_wallet_failure_is_reported():  # W28
+    run = BotRun(
+        {
+            "info:clearinghouseState": (500, None),
+            "info:spotClearinghouseState": (200, SPOT),
+        }
+    ).send("/wallet", WALLET)
+    no_errors(run)
+    assert (
+        run.telegram.texts()[-1] == "❌ Failed to fetch wallet data from Hyperliquid."
+    )
+
+
+def test_alerts_can_be_switched_on_and_off():  # W28
+    run = BotRun(saved_user_data={"aliases": {"zz-whale": WALLET}})
+    tap = ("tap", run.module.button_data("al", "zz-whale"))
+    run.send("/alerts", tap)
+    no_errors(run)
+    assert len(run.jobs("alerts:111")) == 1
+    assert WALLET in run.saved_user_data()["alert_wallets"]
+    run.send(tap)
+    no_errors(run)
+    assert run.jobs("alerts:111") == ()
+    assert run.saved_user_data()["alert_wallets"] == {}
+
+
+def test_each_user_chooses_how_often():  # W28
+    run = BotRun(saved_user_data={"aliases": {"zz-whale": WALLET}})
+    run.send(
+        "/alerts", ("tap", run.module.button_data("al", "zz-whale")), ("tap", "ai:900")
+    )
+    no_errors(run)
+    assert run.saved_user_data()["alert_every"] == 900
+    (job,) = run.jobs("alerts:111")
+    assert job.job.trigger.interval.total_seconds() == 900
+    assert "✅ Every 15 min" in str(run.telegram.calls[-1][1].get("reply_markup"))
+
+
+def test_alerts_start_again_after_a_restart():  # W28
+    run = BotRun(saved_user_data=alerts_on())
+    assert run.jobs("alerts:111") == ()
+    started(run)
+    assert len(run.jobs("alerts:111")) == 1
+
+
+def test_alert_summarises_all_trades_since_the_last_check():  # W28
+    fills = [
+        fill(1, "BTC", "A", "1.0", "78000", "0.0"),
+        fill(2, "BTC", "A", "0.5", "78100", "-1.0"),
+        fill(3, "ETH", "A", "2", "3000", "2", pnl="150.5"),
+        fill(4, "@107", "B", "10", "40", "0"),
+    ]
+    run = started(BotRun(saved_user_data=alerts_on()))
+    check_now(
+        run, {"info:userFillsByTime": (200, fills), "info:spotMeta": (200, SPOT_META)}
+    )
+    no_errors(run)
+    text = sent_text(run)
+    for expected in [
+        "<b>zz-whale</b> traded since",
+        "<b>BTC</b> perp · 2 trade(s) · opened SHORT 1.5 · sold 1.5 (avg 78,033.3)",
+        "<b>ETH</b> perp · 1 trade(s) · closed LONG · sold 2 (avg 3,000) · realised PnL +$150.50",
+        "<b>HYPE/USDC</b> spot · 1 trade(s) · bought 10 (avg 40)",
+    ]:
+        assert expected in text, (expected, text)
+    body = FakeHypurrscan.bodies[0]
+    assert (body["startTime"], body["endTime"]) == (1000, int(LATER * 1000))
+    # Next check starts right after this one: no gaps, no repeats
+    assert run.saved_user_data()["alert_wallets"][WALLET] == int(LATER * 1000) + 1
+
+
+def test_no_message_when_nothing_was_traded():  # W28
+    run = started(BotRun(saved_user_data=alerts_on()))
+    check_now(run, {"info:userFillsByTime": (200, [])})
+    no_errors(run)
+    assert run.telegram.count("sendMessage") == 0
+    assert run.saved_user_data()["alert_wallets"][WALLET] == int(LATER * 1000) + 1
+
+
+def test_failed_check_asks_for_the_same_period_again():  # W28
+    run = started(BotRun(saved_user_data=alerts_on()))
+    check_now(run, {"info:userFillsByTime": (500, None)})
+    no_errors(run)
+    assert run.telegram.count("sendMessage") == 0
+    assert run.saved_user_data()["alert_wallets"][WALLET] == 1000
+
+
+def test_many_trades_are_fetched_in_pages():  # W28
+    first = [
+        fill(i, "BTC", "B", "1", "10", str(i), time_ms=1000 + i) for i in range(2000)
+    ]
+    rest = [first[-1]] + [  # The last trade again (same time), then 5 new ones
+        fill(2000 + i, "BTC", "B", "1", "10", str(2000 + i), time_ms=3000 + i)
+        for i in range(5)
+    ]
+
+    def pages(body):
+        return (200, first if body["startTime"] == 1000 else rest)
+
+    run = started(BotRun(saved_user_data=alerts_on()))
+    check_now(run, {"info:userFillsByTime": pages, "info:spotMeta": (200, SPOT_META)})
+    no_errors(run)
+    assert [
+        b["startTime"] for b in FakeHypurrscan.bodies if b["type"] == "userFillsByTime"
+    ] == [1000, 2999]
+    assert "2005 trade(s)" in sent_text(run)
+
+
+def test_removing_the_alias_stops_its_alerts():  # W28
+    run = started(BotRun(saved_user_data=alerts_on()))
+    run.send("/remove_alias", ("tap", run.module.remove_button_data("zz-whale")))
+    no_errors(run)
+    assert run.jobs("alerts:111") == ()
+    assert run.saved_user_data()["alert_wallets"] == {}
+
+
+def test_alerts_say_when_the_package_is_missing():  # W28
+    run = BotRun(saved_user_data=alerts_on(), no_job_queue=True)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), warnings.catch_warnings():
+        warnings.simplefilter("ignore", PTBUserWarning)  # PTB's own "no JobQueue" note
+        started(run)
+        run.send("/alerts")
+    no_errors(run)
+    assert "pip install -r requirements.txt" in run.telegram.texts()[-1]
+    assert "Warning: wallet alerts are off" in out.getvalue()
+
+
+def test_search_finds_your_own_aliases():  # W30
+    run = BotRun(
+        {ALIASES_URL: (200, {})},
+        saved_user_data={"aliases": {"zz-Treasury Main": ADDR}},
+    )
+    run.send("/search_alias", "treasury")
+    no_errors(run)
+    assert "1 of your aliases contain" in sent_text(run)
+    assert "zz-Treasury Main" in sent_text(run)
+
+
+def test_search_by_address_shows_your_own_alias():  # W30
+    run = BotRun(
+        {ALIASES_URL: (200, {})}, saved_user_data={"aliases": {"zz-main": ADDR}}
+    )
+    run.send("/search_alias", ADDR)
+    no_errors(run)
+    assert "Saved by you as" in sent_text(run) and "zz-main" in sent_text(run)
+
+
+def test_rename_by_tapping():  # W30
+    run = BotRun(saved_user_data={"aliases": {"zz-old": ADDR}})
+    run.send("/rename_alias", ("tap", run.module.button_data("rn", "zz-old")), "zz-New")
+    no_errors(run)
+    assert run.saved_user_data()["aliases"] == {"zz-New": ADDR}
+
+
+def test_rename_refuses_a_name_already_in_use():  # W30
+    run = BotRun(saved_user_data={"aliases": {"zz-a": ADDR, "zz-b": ADDR2}})
+    run.send("/rename_alias", "zz-a", "ZZ-B")
+    no_errors(run)
+    assert "already used" in run.telegram.texts()[-1]
+    assert run.saved_user_data()["aliases"] == {"zz-a": ADDR, "zz-b": ADDR2}
+
+
+def test_export_sends_a_csv_file():  # W30
+    run = BotRun(saved_user_data={"aliases": {"zz-b": ADDR2, "zz-a": ADDR}})
+    run.send("/export_aliases")
+    no_errors(run)
+    ((filename, content),) = run.telegram.documents
+    assert filename == "aliases.csv"
+    rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
+    assert rows == [["alias", "address"], ["zz-a", ADDR], ["zz-b", ADDR2]]
+
+
+def test_import_adds_aliases_and_reports_problems():  # W30
+    content = (
+        "alias,address\n"
+        f"zz-new,{ADDR2}\n"
+        f"ZZ-KEEP,{ADDR2}\n"
+        "zz-bad,not-an-address\n"
+        f",{WALLET}\n"
+        f"zz-keep,{ADDR}\n"
+    ).encode()
+    run = BotRun(saved_user_data={"aliases": {"zz-keep": ADDR}})
+    run.send("/import_aliases", ("document", "zz.csv", content))
+    no_errors(run)
+    assert run.saved_user_data()["aliases"] == {"zz-keep": ADDR, "zz-new": ADDR2}
+    reply = run.telegram.texts()[-1]
+    for expected in [
+        "1 new alias(es) added",
+        "1 were already saved",
+        "row 4, 5",
+        "kept as they were",
+    ]:
+        assert expected in reply, (expected, reply)
+
+
+def test_import_reads_excel_csv_with_semicolons():  # W30
+    content = f"alias;address\r\nzz-x;{ADDR}\r\n".encode("utf-8-sig")
+    run = BotRun().send("/import_aliases", ("document", "zz.csv", content))
+    no_errors(run)
+    assert run.saved_user_data()["aliases"] == {"zz-x": ADDR}
+
+
+def test_export_then_import_gives_the_same_aliases():  # W30
+    aliases = {"zz-ñame 🚀": ADDR, "zz-other": ADDR2}
+    exported = BotRun(saved_user_data={"aliases": aliases}).send("/export_aliases")
+    ((_, content),) = exported.telegram.documents
+    run = BotRun().send("/import_aliases", ("document", "aliases.csv", content))
+    no_errors(run)
+    assert run.saved_user_data()["aliases"] == aliases
+
+
+def test_import_refuses_big_files_and_asks_for_a_file():  # W30
+    run = BotRun().send("/import_aliases", ("document", "zz.csv", b"x" * 100_001))
+    no_errors(run)
+    assert "too big" in run.telegram.texts()[-1]
+    run.send("zz-hello")
+    no_errors(run)
+    assert "send the CSV as a file" in run.telegram.texts()[-1]
+
+
+def test_group_command_for_this_bot_points_to_a_private_chat():  # Group chats (option A)
+    for command in ["/view_aliases@zz_bot", "/wallet"]:
+        run = BotRun(saved_user_data={"aliases": {"zz-secret": ADDR}}, chat=GROUP)
+        run.send(command)
+        no_errors(run)
+        (params,) = [p for e, p in run.telegram.calls if e == "sendMessage"]
+        assert "private chats" in params["text"] and "zz-secret" not in params["text"]
+        assert "https://t.me/zz_bot" in str(params["reply_markup"])
+
+
+def test_group_chatter_and_other_bots_are_ignored():  # Group chats (option A)
+    run = BotRun(chat=GROUP).send(
+        "zz-gm everyone", "/start@zz_other_bot", "/zz_unknown"
+    )
+    no_errors(run)
+    assert run.telegram.count("sendMessage") == 0
+
+
+def test_group_button_tap_gets_a_private_chat_notice():  # Group chats (option A)
+    run = BotRun(chat=GROUP).send(("tap", "Check a wallet"))
+    no_errors(run)
+    (answer,) = [p for e, p in run.telegram.calls if e == "answerCallbackQuery"]
+    assert "private chats" in answer["text"]
+    assert run.telegram.count("sendMessage") == 0
+
+
+def test_rounding_noise_in_positions_is_ignored():  # W28
+    # Hyperliquid sends positions with float noise, e.g. -1.0000000001 for -1 (seen live 2026-10-20)
+    fills = [
+        fill(1, "BTC", "B", "1", "78000", "-1.0000000001"),
+        fill(2, "ETH", "A", "2", "3000", "0.0000000002"),
+    ]
+    run = started(BotRun(saved_user_data=alerts_on()))
+    check_now(
+        run, {"info:userFillsByTime": (200, fills), "info:spotMeta": (200, SPOT_META)}
+    )
+    no_errors(run)
+    assert "<b>BTC</b> perp · 1 trade(s) · closed SHORT" in sent_text(run)
+    assert "<b>ETH</b> perp · 1 trade(s) · opened SHORT 2" in sent_text(run)
