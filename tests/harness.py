@@ -63,6 +63,7 @@ class FakeTelegram(BaseRequest):
 
     def __init__(self):
         self.calls, self._next_id = [], 5000
+        self.shown = {}  # message_id -> (text, buttons) after an edit
         self.files = {}  # file_id -> bytes, for files "sent" by the test user
         self.documents = []  # (filename, bytes) of every file the bot sent
 
@@ -135,6 +136,20 @@ class FakeTelegram(BaseRequest):
                         "description": "Bad Request: can't parse entities",
                     }
                 ).encode()
+            if endpoint == "editMessageText":
+                # Telegram refuses an edit that changes nothing
+                content = (params["text"], str(params.get("reply_markup")))
+                if self.shown.get(params.get("message_id")) == content:
+                    return 400, json.dumps(
+                        {
+                            "ok": False,
+                            "error_code": 400,
+                            "description": "Bad Request: message is not modified: specified new "
+                            "message content and reply markup are exactly the same as a current "
+                            "content and reply markup of the message",
+                        }
+                    ).encode()
+                self.shown[params.get("message_id")] = content
             self._next_id += 1
             result = {
                 "message_id": self._next_id,

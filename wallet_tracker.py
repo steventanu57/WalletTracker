@@ -1,3 +1,10 @@
+# Hyperliquid Wallet Tracker: a Telegram bot for looking up and following Hyperliquid wallets.
+#
+# HOW TO CONFIGURE
+#   .env           Required: BOT_TOKEN, from @BotFather. Copy .env.example to .env: it has the steps.
+#   This file      Optional: alert intervals, page sizes, timeouts and limits are under
+#                  "SETTINGS YOU CAN CHANGE" below. Restart the bot after a change.
+#   bot_data.pkl   Written by the bot (users' aliases, alert settings, open questions); don't edit it.
 import asyncio
 import csv
 import functools
@@ -9,6 +16,7 @@ import re
 import sys
 import time
 import traceback
+import unicodedata
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote
@@ -24,6 +32,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ChatType, MessageEntityType
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     ApplicationHandlerStop,
@@ -51,45 +60,55 @@ load_dotenv(BASE_DIR / ".env")
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# ======== SETTINGS YOU CAN CHANGE ========
+# Restart the bot after a change. Your bot token goes in .env (see .env.example), not here.
+# The "Every ..." choices in /alerts: seconds -> label
+ALERT_INTERVALS = {900: "15 min", 3600: "1 h", 14400: "4 h"}
+# For users who haven't chosen; must be one of ALERT_INTERVALS
+DEFAULT_ALERT_INTERVAL = 3600
+QUESTION_TIMEOUT_SECONDS = 600  # A typed answer that comes later than this isn't taken
+# Lines per page. A page must fit in one Telegram message (4096 characters): the tests
+# check that the current sizes do, so run them after a change.
+HOLDERS_PER_PAGE = 15
+GLOBAL_ALIASES_PER_PAGE = 30
+NAME_MATCHES_SHOWN = 10  # Public names listed when searching by part of a name
+# Alias buttons per message. With more aliases, the rest can still be picked by typing
+# the name; the alerts menu has pages instead
+ALIAS_BUTTONS_SHOWN = 50
+TOKEN_SUGGESTIONS = 5  # "Did you mean ...?" buttons for a token name that wasn't found
+IMPORT_MAX_BYTES = 100_000  # The biggest CSV file /import_aliases takes
+IMPORT_MAX_ROWS = 1000  # ... and the most rows
+# Downloaded at most this often: Hypurrscan's public names (~30 KB) and Hyperliquid's spot list
+ALIAS_CACHE_SECONDS = 600
+SPOT_NAMES_CACHE_SECONDS = 3600
+# "Send /start ..." and "I don't know that command" go to each user at most this often,
+# so someone sending lots of messages doesn't make the bot send lots back
+HINT_EVERY_SECONDS = 60
+# How long to wait for an answer from Hypurrscan or Hyperliquid
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# ======== FIXED VALUES (don't change: they follow Telegram's, Hypurrscan's and Hyperliquid's rules) ========
 ADDRESS_RE = re.compile(
     r"0x[0-9a-f]{40}"
 )  # Hyperliquid addresses: 0x + 40 hex characters
-
 # Hypurrscan's public API (no key needed)
 GLOBAL_ALIASES_URL = "https://api.hypurrscan.io/globalAliases"
 HOLDERS_URL = "https://api.hypurrscan.io/holdersWithLimit/{token}/{limit}"
 ADDRESS_PAGE_URL = "https://hypurrscan.io/address/{address}"
 # Hyperliquid's public API (no key needed): positions, balances and trades of any wallet
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
-
-MESSAGE_LIMIT = 4000  # Telegram refuses messages over 4096 characters, so long lists are split below this
-ALIAS_CACHE_SECONDS = (
-    600  # The public names list (~30 KB) is downloaded at most once every 10 minutes
-)
-SPOT_NAMES_CACHE_SECONDS = 3600  # Hyperliquid's list of spot pairs changes rarely
-HOLDERS_PER_PAGE = 15
+# Telegram refuses messages over 4096 characters, so long lists are split below this
+MESSAGE_LIMIT = 4000
+# Long names are shortened inside page lists, so a page always fits in one message
+NAME_SHOWN_CHARS = 40
 HOLDERS_MAX = (
     1000  # Paging stops here (the largest list size checked against the live API)
 )
-GLOBAL_ALIASES_PER_PAGE = 30
-NAME_MATCHES_SHOWN = 10
-NAME_SHOWN_CHARS = 40  # Long names are shortened inside page lists, so a page always fits in one message
-ALIAS_BUTTONS_SHOWN = (
-    50  # With more aliases than this, the rest can still be picked by typing the name
-)
-QUESTION_TIMEOUT_SECONDS = (
-    600  # A typed answer that comes later than this isn't taken as the answer
-)
-ALERT_INTERVALS = {900: "15 min", 3600: "1 h", 14400: "4 h"}  # Seconds -> label
-DEFAULT_ALERT_INTERVAL = 3600
 FILLS_PER_REQUEST = 2000  # Hyperliquid returns at most this many trades per request
-FILLS_MAX_PAGES = 5  # So at most 10,000 trades per wallet per check (Hyperliquid keeps the last 10,000)
-IMPORT_MAX_BYTES = 100_000
-IMPORT_MAX_ROWS = 1000
-NO_PREVIEW = LinkPreviewOptions(
-    is_disabled=True
-)  # Don't show a website preview under messages with links
+# So at most 10,000 trades per wallet per check (Hyperliquid keeps the last 10,000)
+FILLS_MAX_PAGES = 5
+# Don't show a website preview under messages with links
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # Conversation states (saved in bot_data.pkl, so keep the numbers)
 START_BUTTON_TAPS = 0
@@ -160,10 +179,39 @@ COMMANDS = [
     ("search_alias", "Find the public name of an address, or addresses by name"),
     ("get_global_aliases", "Browse the public names on Hypurrscan"),
     ("get_top_holders", "Show the top holders of a token, e.g. USDC"),
-    ("help", "List the commands"),
+    ("help", "Commands, and how to find addresses and token names"),
     ("cancel", "Leave the current step"),
 ]
 KNOWN_COMMANDS = {command for command, _ in COMMANDS}
+# The rest of /help: the values new users ask about
+HELP_GUIDE = [
+    "",
+    "<b>Finding wallet addresses</b>",
+    "A Hyperliquid address is 0x followed by 40 characters (0-9 and a-f).",
+    "• Your own: copy it from the wallet you use with Hyperliquid (MetaMask, Rabby, …).",
+    (
+        '• Other traders: the <a href="https://app.hyperliquid.xyz/leaderboard">Hyperliquid '
+        'leaderboard</a>, or <a href="https://hypurrscan.io">Hypurrscan</a>.'
+    ),
+    (
+        "• In this bot: /search_alias finds addresses by public name (e.g. HyperEVM), "
+        "and /get_top_holders shows who holds a token."
+    ),
+    "",
+    "<b>Token names on Hyperliquid</b>",
+    "• Perps (futures) use the usual names: BTC, ETH, SOL.",
+    (
+        "• Spot tokens have Hyperliquid's own names: Bitcoin is UBTC, Ether UETH and Solana "
+        "USOL (Unit Bitcoin, Unit Ethereum, Unit Solana), next to HYPE, USDC and many more."
+    ),
+    "• /get_top_holders needs the spot name. Type BTC and it suggests UBTC.",
+    "• In alerts, spot trades show as pairs, like UBTC/USDC.",
+    "",
+    (
+        "<b>Importing aliases</b>: a CSV file with two columns, alias,address "
+        "(the file from /export_aliases has this format)."
+    ),
+]
 
 # Markups for buttons
 ASK_MARKUP = InlineKeyboardMarkup(
@@ -284,6 +332,13 @@ async def get_global_alias_data():
 
 async def get_spot_names():
     """Spot pairs' readable names, e.g. {"@107": "HYPE/USDC"} (trades use the "@107" form). {} if unavailable."""
+    return (await load_spot_meta())[0]
+
+
+async def load_spot_meta():
+    """Hyperliquid's spot list, downloaded at most once an hour, as (pair names, tokens):
+    pair names like {"@107": "HYPE/USDC"}, and tokens as [(name, full name)], like
+    ("UBTC", "Unit Bitcoin"). ({}, []) if unavailable."""
     cached = spot_names_cache["data"]
     if (
         cached is not None
@@ -293,20 +348,25 @@ async def get_spot_names():
 
     meta = await hyperliquid({"type": "spotMeta"})
     if not isinstance(meta, dict):
-        return {}
+        return {}, []
     tokens = {
-        token.get("index"): token.get("name")
+        token.get("index"): token
         for token in meta.get("tokens", [])
-        if isinstance(token, dict)
+        if isinstance(token, dict) and isinstance(token.get("name"), str)
     }
     names = {}
     for pair in meta.get("universe", []):
         try:
-            names[pair["name"]] = "/".join(tokens[index] for index in pair["tokens"])
+            names[pair["name"]] = "/".join(
+                tokens[index]["name"] for index in pair["tokens"]
+            )
         except (KeyError, TypeError):
             continue  # A pair with missing details keeps its "@123" name
-    spot_names_cache.update(time=time.monotonic(), data=names)
-    return names
+    token_names = [
+        (token["name"], token.get("fullName") or "") for token in tokens.values()
+    ]
+    spot_names_cache.update(time=time.monotonic(), data=(names, token_names))
+    return names, token_names
 
 
 def system_label(address):
@@ -445,6 +505,22 @@ async def say_lines(update, context, lines, reply_markup=None):
     await send_lines(context.bot, update.effective_chat.id, lines, reply_markup)
 
 
+async def edit_menu(query, text, reply_markup):
+    """Redraws the menu a button belongs to, in place. Telegram refuses an edit that changes
+    nothing ("message is not modified", e.g. a button tapped twice quickly); the menu
+    already shows the right thing then, so that's not an error."""
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            link_preview_options=NO_PREVIEW,
+        )
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
 async def ask(update, context, text, reply_markup=CANCEL_MARKUP):
     """Asks a question that waits for a typed answer. Every question has a Cancel button.
     The time is remembered, so an answer that comes much later isn't taken (see answer_in_time)."""
@@ -481,7 +557,25 @@ async def show_typing(update, context):
 
 
 def user_name(update):
-    return update.effective_user.first_name if update.effective_user else "Someone"
+    return (
+        clean(update.effective_user.first_name) if update.effective_user else "Someone"
+    )
+
+
+# Characters that turn text around on screen (could make a log line read differently)
+DIRECTION_MARKS = set("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def clean(text, limit=60):
+    """Text from users (names, what they type), made safe for the terminal: control codes and
+    line breaks become spaces, so nobody can change your terminal or fake a line of the log,
+    and it's shortened to `limit` characters."""
+    text = "".join(
+        " " if unicodedata.category(c) == "Cc" or c in DIRECTION_MARKS else c
+        for c in str(text)
+    )
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def forget_unfinished(context):
@@ -585,7 +679,8 @@ async def start(update: Update, context: CallbackContext) -> int:
         f"👋 <b>Hello {html.escape(name)}!</b>\nWelcome to <b>Hyperliquid Wallet Tracker</b> Bot!\n \n"
         "Click the buttons below to access commands\n"
         "OR\n"
-        "Click the <b>Menu</b> button beside the chat bar",
+        "Click the <b>Menu</b> button beside the chat bar\n \n"
+        "New here? Send /help to see how to find wallet addresses and token names.",
         reply_markup=AIO_MARKUP,
     )
 
@@ -633,7 +728,7 @@ async def help_command(update: Update, context: CallbackContext) -> None:
     lines += [
         f"/{command} - {html.escape(description)}" for command, description in COMMANDS
     ]
-    await say(update, context, "\n".join(lines))
+    await say_lines(update, context, lines + HELP_GUIDE)
 
 
 async def set_bot_commands(app) -> None:
@@ -666,7 +761,8 @@ async def register_alias1(update: Update, context: CallbackContext) -> int:
     await ask(
         update,
         context,
-        "Please enter a valid address to be added to the list of aliases (e.g 0xffffffffffffffffffffffffffffffffffffffff)",
+        "Please enter a valid address to be added to the list of aliases (e.g 0xffffffffffffffffffffffffffffffffffffffff)\n"
+        "Where to find wallet addresses: /help",
     )
 
     return REGISTER_ALIAS1
@@ -675,7 +771,7 @@ async def register_alias1(update: Update, context: CallbackContext) -> int:
 async def register_alias2(update: Update, context: CallbackContext) -> int:
     address = update.message.text.strip().lower()
 
-    print(f"{user_name(update)} is appending {address}")
+    print(f"{user_name(update)} is appending {clean(address)}")
 
     if not ADDRESS_RE.fullmatch(address):
         await ask(
@@ -760,7 +856,7 @@ async def save_alias(update, context, alias) -> int:
         context,
         f"✅ Alias <b>{html.escape(alias)}</b> saved for address {address_html(address)}",
     )
-    print(f"{user_name(update)} registered alias {alias} for address {address}")
+    print(f"{user_name(update)} registered alias {clean(alias)} for address {address}")
 
     await say_lines(update, context, alias_lines(aliases))
     await say(
@@ -781,7 +877,8 @@ async def register_again(update: Update, context: CallbackContext) -> int:
     await ask(
         update,
         context,
-        "Please enter a valid address to be added to the list of aliases (e.g 0xffffffffffffffffffffffffffffffffffffffff)",
+        "Please enter a valid address to be added to the list of aliases (e.g 0xffffffffffffffffffffffffffffffffffffffff)\n"
+        "Where to find wallet addresses: /help",
     )
     print(f"{user_name(update)} is trying to register another address")
     return REGISTER_ALIAS1
@@ -819,7 +916,7 @@ async def remove_alias2(update: Update, context: CallbackContext) -> int:
             reply_markup=remove_markup(aliases),
         )
         print(
-            f"{user_name(update)} failed to remove alias {update.message.text.strip()}"
+            f"{user_name(update)} failed to remove alias {clean(update.message.text)}"
         )
         return REMOVE_ALIAS1
 
@@ -844,7 +941,7 @@ async def remove_and_ask_again(update, context, alias) -> int:
     address = aliases.pop(alias)  # Removes the key and the value in the dict
     context.user_data.pop("asked_at", None)
     drop_unused_alert(update, context, address)
-    print(f"{user_name(update)} has successfully removed {alias} from aliases")
+    print(f"{user_name(update)} has successfully removed {clean(alias)} from aliases")
 
     if aliases:
         await say_lines(update, context, alias_lines(aliases))
@@ -967,7 +1064,7 @@ async def rename_alias3(update: Update, context: CallbackContext) -> int:
         f"✅ Renamed <b>{html.escape(old)}</b> to <b>{html.escape(new)}</b>",
     )
     await say_lines(update, context, alias_lines(aliases))
-    print(f"{user_name(update)} renamed alias {old} to {new}")
+    print(f"{user_name(update)} renamed alias {clean(old)} to {clean(new)}")
     return ConversationHandler.END
 
 
@@ -1209,7 +1306,7 @@ async def wallet1(update: Update, context: CallbackContext) -> int:
     await ask(
         update,
         context,
-        "Which wallet? Send one of your aliases or an address"
+        "Which wallet? Send one of your aliases or an address (where to find one: /help)"
         + ("\n(or tap a saved one below)" if aliases else ""),
         reply_markup=pick_markup(aliases, "w", "👛"),
     )
@@ -1299,12 +1396,23 @@ def drop_unused_alert(update, context, address):
         schedule_alerts(context.job_queue, update.effective_user.id, context.user_data)
 
 
-def alerts_menu(context):
+def alerts_menu(context, offset=0):
+    # One page of wallets (ALIAS_BUTTONS_SHOWN per page), starting at alias number offset
     aliases = context.user_data.get("aliases", {})
     wallets = context.user_data.get("alert_wallets") or {}
     every = context.user_data.get("alert_every", DEFAULT_ALERT_INTERVAL)
+    names = sorted(aliases, key=str.lower)
+    per_page = ALIAS_BUTTONS_SHOWN
+    last_page = max(len(names) - 1, 0) // per_page * per_page
+    offset = min(max(offset, 0) // per_page * per_page, last_page)
+    shown = names[offset : offset + per_page]
+    counted = (
+        f" ({offset + 1}-{offset + len(shown)} of {len(names)})"
+        if len(names) > per_page
+        else ""
+    )
     text = (
-        "<b>Wallet alerts</b>\n"
+        f"<b>Wallet alerts</b>{counted}\n"
         "At each check you get one summary of every trade a wallet made since the last check.\n"
         f"Checked every <b>{ALERT_INTERVALS.get(every, '1 h')}</b>. "
         "Tap a wallet to switch its alerts on 🔔 or off 🔕:"
@@ -1316,13 +1424,16 @@ def alerts_menu(context):
                 callback_data=button_data("al", alias),
             )
         ]
-        for alias in sorted(aliases, key=str.lower)[:ALIAS_BUTTONS_SHOWN]
+        for alias in shown
     ]
+    pages = page_buttons("ap", offset, per_page, len(names))
+    if pages:
+        rows.append(pages)
     rows.append(
         [
             InlineKeyboardButton(
                 f"{'✅ ' if seconds == every else ''}Every {label}",
-                callback_data=f"ai:{seconds}",
+                callback_data=f"ai:{seconds}:{offset}",  # The page, to stay on it
             )
             for seconds, label in ALERT_INTERVALS.items()
         ]
@@ -1349,21 +1460,30 @@ async def alerts_command(update: Update, context: CallbackContext) -> None:
 
 
 async def alerts_tap(update: Update, context: CallbackContext) -> None:
-    # 🔔 / 🔕 and "Every ..." buttons under the alerts menu: change the setting and redraw the menu
+    # 🔔 / 🔕, "Every ..." and ◀ / ▶ buttons under the alerts menu: change the setting
+    # (or the page) and redraw the menu
     query = update.callback_query
     if context.job_queue is None:
         await query.answer(ALERTS_MISSING, show_alert=True)
         return
 
-    if query.data.startswith("ai:"):
-        seconds = int(query.data[3:])
+    aliases = context.user_data.get("aliases", {})
+    changed = True
+    if query.data.startswith("ap:"):  # Another page
+        offset, note, changed = int(query.data[3:]), None, False
+    elif query.data.startswith("ai:"):
+        # "ai:<seconds>:<page>"; menus sent before there were pages have "ai:<seconds>"
+        seconds, _, page = query.data[3:].partition(":")
+        seconds, offset = int(seconds), int(page or 0)
         if seconds not in ALERT_INTERVALS:
             await query.answer()
             return
-        context.user_data["alert_every"] = seconds
         note = f"Checking every {ALERT_INTERVALS[seconds]}"
+        if seconds == context.user_data.get("alert_every", DEFAULT_ALERT_INTERVAL):
+            # Already chosen: keep the current timer instead of starting it again
+            note, changed = f"Already checking every {ALERT_INTERVALS[seconds]}", False
+        context.user_data["alert_every"] = seconds
     else:
-        aliases = context.user_data.get("aliases", {})
         alias = alias_from_button(aliases, "al", query.data)
         if alias is None:
             await query.answer("That alias no longer exists")
@@ -1378,13 +1498,14 @@ async def alerts_tap(update: Update, context: CallbackContext) -> None:
                 now_ms()
             )  # Report trades from now on, not the wallet's history
             note = f"🔔 Alerts on for {alias}"
+        # Stay on the page with this alias
+        offset = sorted(aliases, key=str.lower).index(alias)
 
-    schedule_alerts(context.job_queue, update.effective_user.id, context.user_data)
+    if changed:
+        schedule_alerts(context.job_queue, update.effective_user.id, context.user_data)
     await query.answer(note)
-    text, markup = alerts_menu(context)
-    await query.edit_message_text(
-        text, parse_mode="HTML", reply_markup=markup, link_preview_options=NO_PREVIEW
-    )
+    text, markup = alerts_menu(context, offset)
+    await edit_menu(query, text, markup)
 
 
 async def fetch_fills(address, start, end):
@@ -1532,6 +1653,12 @@ def global_aliases_page(data, offset):
 
 
 def page_markup(prefix, offset, per_page, total):
+    buttons = page_buttons(prefix, offset, per_page, total)
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+
+def page_buttons(prefix, offset, per_page, total):
+    # ◀ Previous / Next ▶ (callback data "<prefix>:<offset>"); none when everything fits on one page
     buttons = []
     if offset > 0:
         buttons.append(
@@ -1545,7 +1672,7 @@ def page_markup(prefix, offset, per_page, total):
                 "Next ▶", callback_data=f"{prefix}:{offset + per_page}"
             )
         )
-    return InlineKeyboardMarkup([buttons]) if buttons else None
+    return buttons
 
 
 async def get_global_aliases(update: Update, context: CallbackContext) -> int:
@@ -1584,9 +1711,7 @@ async def page_tap(update: Update, context: CallbackContext) -> None:
         text, markup = page
 
     await query.answer()
-    await query.edit_message_text(
-        text, parse_mode="HTML", reply_markup=markup, link_preview_options=NO_PREVIEW
-    )
+    await edit_menu(query, text, markup)
 
 
 # START_SEARCH_ALIAS
@@ -1603,7 +1728,7 @@ async def search_alias1(update: Update, context: CallbackContext) -> int:
 async def search_alias2(update: Update, context: CallbackContext) -> int:
     # Gets the message from the user
     text = update.message.text.strip()
-    print(f"{user_name(update)} is searching public names for {text}")
+    print(f"{user_name(update)} is searching public names for {clean(text)}")
 
     await show_typing(update, context)
     data = await get_global_alias_data()
@@ -1686,7 +1811,7 @@ async def search_alias2(update: Update, context: CallbackContext) -> int:
     context.user_data.pop("asked_at", None)
     message_lines.append("Would you like to search again?")
     await say_lines(update, context, message_lines, reply_markup=ASK_MARKUP)
-    print(f"{user_name(update)} successfully searched public names for {text}")
+    print(f"{user_name(update)} successfully searched public names for {clean(text)}")
     return SEARCH_AGAIN
 
 
@@ -1704,7 +1829,12 @@ async def top_holders1(
     update: Update, context: CallbackContext
 ) -> int:  # Has to return an int
     # Initiates the question and awaits input
-    await ask(update, context, "Which token would you like to search (e.g., USDC)?")
+    await ask(
+        update,
+        context,
+        "Which token? Send its spot name, e.g. USDC, HYPE or UBTC (Bitcoin).\n"
+        "Not sure of the name? See /help.",
+    )
     return TOP_HOLDERS1
 
 
@@ -1772,9 +1902,43 @@ async def holders_page(context, token, offset):
 
 
 async def top_holders2(update: Update, context: CallbackContext) -> int:
-    # Gets the message from the user
-    token = update.message.text.strip().upper()
-    print(f"{user_name(update)} is searching for top holders of {token}")
+    # The token name the user typed
+    return await show_holders(update, context, update.message.text.strip().upper())
+
+
+async def token_tap(update: Update, context: CallbackContext) -> int:
+    # A "Did you mean ...?" button under "No token called ...": look that name up
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    return await show_holders(update, context, query.data[3:])
+
+
+def suggest_tokens(typed, tokens):
+    """Spot token names close to what was typed, best first, as [(name, full name)]:
+    BTC -> UBTC (Hyperliquid's spot Bitcoin), bitcoin -> UBTC (its full name), HYP -> HYPE."""
+    wanted = typed.lower()
+    ranked = []
+    for name, full in tokens:
+        lower = name.lower()
+        if not wanted or lower == wanted or len(f"tk:{name}".encode()) > 64:
+            continue  # Not found already, or too long for a button
+        if lower == "u" + wanted:
+            rank = 0
+        elif wanted in full.lower():
+            rank = 1
+        elif lower.startswith(wanted):
+            rank = 2
+        elif wanted in lower:
+            rank = 3
+        else:
+            continue
+        ranked.append((rank, len(name), name, full))
+    return [(name, full) for _, _, name, full in sorted(ranked)[:TOKEN_SUGGESTIONS]]
+
+
+async def show_holders(update, context, token) -> int:
+    print(f"{user_name(update)} is searching for top holders of {clean(token)}")
 
     await show_typing(update, context)
     page = await holders_page(context, token, 0) if token else "unknown"
@@ -1783,19 +1947,35 @@ async def top_holders2(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
 
     if page == "unknown":
+        _, tokens = await load_spot_meta()
+        options = suggest_tokens(token, tokens)
+        rows = [
+            [
+                InlineKeyboardButton(
+                    f"{name} ({full})" if full else name, callback_data=f"tk:{name}"
+                )
+            ]
+            for name, full in options
+        ]
+        rows.append([InlineKeyboardButton(CANCEL_BUTTON, callback_data=CANCEL_BUTTON)])
+        hint = (
+            "Did you mean one of these? Tap it, or type another name."
+            if options
+            else "Check the spelling and try again: spot names, e.g. USDC, HYPE or UBTC."
+        )
         await ask(
             update,
             context,
-            f"❌ No token called <b>{html.escape(token)}</b> found on Hyperliquid.\n"
-            "Check the spelling and try again (e.g. USDC, HYPE)",
+            f"❌ No token called <b>{html.escape(token)}</b> found on Hyperliquid.\n{hint}",
+            reply_markup=InlineKeyboardMarkup(rows),
         )
-        print(f"Could not find holder data for {token}")
+        print(f"Could not find holder data for {clean(token)}")
         return TOP_HOLDERS1  # Retry
 
     context.user_data.pop("asked_at", None)
     text, markup = page
     await say(update, context, text, reply_markup=markup)
-    print(f"{user_name(update)} successfully found holders of {token}")
+    print(f"{user_name(update)} successfully found holders of {clean(token)}")
 
     await say(
         update,
@@ -1838,7 +2018,10 @@ async def nothing_to_cancel(update: Update, context: CallbackContext) -> None:
 
 
 async def unknown_command(update: Update, context: CallbackContext) -> None:
-    await say(update, context, "I don't know that command. Send /help to see them all.")
+    if hint_due(update, "command"):
+        await say(
+            update, context, "I don't know that command. Send /help to see them all."
+        )
 
 
 async def expired_button(update: Update, context: CallbackContext) -> None:
@@ -1848,15 +2031,30 @@ async def expired_button(update: Update, context: CallbackContext) -> None:
     )
 
 
-async def console(update: Update, context: CallbackContext) -> None:
-    """
-    This function would be added to the dispatcher as a handler for messages coming from the Bot API
-    """
-    # Print to console
-    print(f"{user_name(update)} wrote {update.message.text}")
-    await say(
-        update, context, "Send /start to see what I can do, or /help for the commands."
-    )
+# When each user last got a hint, per kind: (user id, kind) -> seconds. Not saved, so a
+# restart starts afresh.
+last_hint = {}
+
+
+def hint_due(update, kind):
+    """True at most once every HINT_EVERY_SECONDS per user and kind, so someone sending lots
+    of messages the bot doesn't understand gets one pointer instead of a reply to each."""
+    key = (update.effective_user.id if update.effective_user else 0, kind)
+    if key in last_hint and now() - last_hint[key] < HINT_EVERY_SECONDS:
+        return False
+    last_hint[key] = now()
+    return True
+
+
+async def no_question_open(update: Update, context: CallbackContext) -> None:
+    # A message when no question is open. It isn't printed: users' messages stay private,
+    # and nothing they send can end up in your terminal.
+    if hint_due(update, "text"):
+        await say(
+            update,
+            context,
+            "Send /start to see what I can do, or /help for the commands.",
+        )
 
 
 async def on_error(update: object, context: CallbackContext) -> None:
@@ -1900,8 +2098,10 @@ def main() -> None:
         CallbackQueryHandler(page_tap, pattern=r"^(ga|th:.+):\d+$")
     )  # ◀ / ▶ under lists
     app.add_handler(
-        CallbackQueryHandler(alerts_tap, pattern=r"^(al:[0-9a-f]+|ai:\d+)$")
-    )  # 🔔 / 🔕 and "Every ..." under the alerts menu
+        CallbackQueryHandler(
+            alerts_tap, pattern=r"^(al:[0-9a-f]+|ai:\d+(:\d+)?|ap:\d+)$"
+        )
+    )  # 🔔 / 🔕, "Every ..." and ◀ / ▶ under the alerts menu
 
     # ConversationHandler consists of
     # entry_points: Starting the function with an input and returns an int
@@ -1936,7 +2136,10 @@ def main() -> None:
             # ~filters.COMMAND is a bitwise NOT operator which ignores any commands (anything starting with /)
             # filters.TEXT & ~filters.COMMAND = “Only match plain text messages that are not commands.”
             START_BUTTON_TAPS: [menu_tap],
-            TOP_HOLDERS1: [typed(top_holders2)],
+            TOP_HOLDERS1: [
+                typed(top_holders2),
+                CallbackQueryHandler(token_tap, pattern=r"^tk:"),
+            ],
             SEARCH_ALIAS1: [typed(search_alias2)],
             REGISTER_ALIAS1: [typed(register_alias2)],
             REGISTER_ALIAS2: [typed(register_alias3)],
@@ -1991,9 +2194,9 @@ def main() -> None:
     )  # /cancel with no question open
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(CallbackQueryHandler(expired_button))  # Buttons of old messages
-    # This is for all messages, it will print them in the terminal and point the user to /start
+    # Any other message: point the user to /start (at most once a minute)
     app.add_handler(
-        MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, console)
+        MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND, no_question_open)
     )
     app.add_error_handler(on_error)
 

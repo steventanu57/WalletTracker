@@ -13,6 +13,7 @@ import warnings
 from unittest import mock
 
 import aiohttp
+import harness
 from harness import GROUP, BotRun, FakeHypurrscan, bot_dir
 from telegram.warnings import PTBUserWarning
 
@@ -222,9 +223,10 @@ def test_token_with_spaces_is_trimmed():  # W4
 
 
 def test_token_cannot_change_the_request_path():  # W4
-    run = BotRun({HOLDERS: (200, {})}).send("/get_top_holders", "usdc/../x")
+    run = BotRun({HOLDERS: (200, {}), "info:spotMeta": (200, SPOT_META)})
+    run.send("/get_top_holders", "usdc/../x")
     no_errors(run)
-    assert FakeHypurrscan.requested == [
+    assert [u for u in FakeHypurrscan.requested if HOLDERS in u] == [
         "https://api.hypurrscan.io/holdersWithLimit/USDC%2F..%2FX/15"
     ]
 
@@ -316,7 +318,8 @@ def test_bot_sets_its_menu_commands_on_startup():  # W11
 
 
 def test_unknown_token_says_so():  # W13
-    run = BotRun({HOLDERS: (200, {})}).send("/get_top_holders", "zznotatoken")
+    run = BotRun({HOLDERS: (200, {}), "info:spotMeta": (200, SPOT_META)})
+    run.send("/get_top_holders", "zznotatoken")
     no_errors(run)
     assert "No token called <b>ZZNOTATOKEN</b>" in run.telegram.texts()[-1]
 
@@ -381,10 +384,13 @@ def test_public_names_downloaded_once_for_several_searches():  # W19
 
 
 def test_one_connection_is_reused():  # W20
-    run = BotRun({ALIASES_URL: (200, {}), HOLDERS: (200, {})})
+    routes = {ALIASES_URL: (200, {}), HOLDERS: (200, {})}
+    run = BotRun({**routes, "info:spotMeta": (200, SPOT_META)})
     run.send("/get_top_holders", "ZZ1", "ZZ2")
     no_errors(run)
-    assert len(FakeHypurrscan.requested) == 2 and FakeHypurrscan.opened == 1
+    asked = FakeHypurrscan.requested
+    assert len([u for u in asked if HOLDERS in u]) == 2 and FakeHypurrscan.opened == 1
+    assert len([u for u in asked if "spotMeta" in u]) == 1  # Kept for an hour
 
 
 def test_addresses_are_tap_to_copy_with_a_link():  # W21
@@ -429,7 +435,8 @@ def test_no_more_silence():  # W24
 
 
 def test_typing_is_shown_while_waiting():  # W25
-    run = BotRun({HOLDERS: (200, {})}).send("/get_top_holders", "ZZ")
+    run = BotRun({HOLDERS: (200, {}), "info:spotMeta": (200, SPOT_META)})
+    run.send("/get_top_holders", "ZZ")
     no_errors(run)
     assert run.telegram.count("sendChatAction") == 1
 
@@ -866,3 +873,184 @@ def test_rounding_noise_in_positions_is_ignored():  # W28
     no_errors(run)
     assert "<b>BTC</b> perp · 1 trade(s) · closed SHORT" in sent_text(run)
     assert "<b>ETH</b> perp · 1 trade(s) · opened SHORT 2" in sent_text(run)
+
+
+# ---------- found by the end-to-end test (tests/e2e: real bot process, simulated Telegram) ----------
+def many_aliases(count):
+    return {f"zz-w{i:02d}": "0x" + f"{i:040x}" for i in range(count)}
+
+
+def menus(run):
+    # (text, buttons as text) of every message the bot sent or edited
+    return [
+        (p["text"], str(p.get("reply_markup")))
+        for e, p in run.telegram.calls
+        if e in ("sendMessage", "editMessageText")
+    ]
+
+
+def popups(run):
+    return [p.get("text") for e, p in run.telegram.calls if e == "answerCallbackQuery"]
+
+
+def test_tapping_the_interval_already_chosen_is_fine():  # W33
+    run = BotRun(saved_user_data={**alerts_on(), "alert_every": 900})
+    run.send("/alerts", ("tap", "ai:900"), ("tap", "ai:900"))
+    no_errors(run)
+    assert "Something went wrong" not in sent_text(run)
+    assert popups(run) == ["Already checking every 15 min"] * 2
+
+
+def test_tapping_a_page_button_twice_is_fine():  # W33
+    names = {"0x" + f"{i:040x}": f"zz-label-{i}" for i in range(100)}
+    run = BotRun({ALIASES_URL: (200, names)})
+    run.send("/get_global_aliases", ("tap", "ga:30"), ("tap", "ga:30"))
+    no_errors(run)
+    assert "Something went wrong" not in sent_text(run)
+
+
+def test_alerts_menu_without_pages_for_up_to_50_wallets():  # W34
+    run = BotRun(saved_user_data={"aliases": many_aliases(50)})
+    run.send("/alerts")
+    no_errors(run)
+    ((text, buttons),) = menus(run)
+    assert "zz-w49" in buttons and "ap:" not in buttons and "of 50" not in text
+
+
+def test_alerts_menu_pages_through_many_wallets():  # W34
+    run = BotRun(saved_user_data={"aliases": many_aliases(60)})
+    run.send("/alerts", ("tap", "ap:50"))
+    no_errors(run)
+    (text1, first), (text2, second) = menus(run)
+    assert "1-50 of 60" in text1 and "zz-w49" in first and "zz-w50" not in first
+    assert "ap:50" in first  # Next
+    assert "51-60 of 60" in text2 and "zz-w59" in second and "zz-w49" not in second
+    assert "ap:0" in second  # Previous
+
+
+def test_alerts_for_a_wallet_on_a_later_page():  # W34
+    aliases = many_aliases(60)
+    run = BotRun(saved_user_data={"aliases": aliases})
+    tap = ("tap", run.module.button_data("al", "zz-w55"))
+    run.send("/alerts", tap, ("tap", "ai:900:50"))
+    no_errors(run)
+    saved = run.saved_user_data()
+    assert aliases["zz-w55"] in saved["alert_wallets"] and saved["alert_every"] == 900
+    for text, buttons in menus(run)[1:]:  # Both redraws stay on that wallet's page
+        assert "51-60 of 60" in text and "🔔 zz-w55" in buttons
+
+
+# ---------- easier to use: help, token names, clear questions, a safe terminal (U6-U8, U11) ----------
+SPOT_TOKENS = {
+    "universe": [{"name": "@142", "tokens": [197, 0], "index": 142}],
+    "tokens": [
+        {"name": "USDC", "index": 0, "fullName": None},
+        {"name": "HYPE", "index": 150, "fullName": "Hyperliquid"},
+        {"name": "UBTC", "index": 197, "fullName": "Unit Bitcoin"},
+        {"name": "UETH", "index": 221, "fullName": "Unit Ethereum"},
+    ],
+}
+NO_BTC = {
+    "holdersWithLimit/BTC/": (
+        200,
+        {},
+    ),  # Hyperliquid's spot market has no token called BTC
+    "holdersWithLimit/UBTC/": (200, {"holders": {ADDR: 5.0}, "holdersCount": 1}),
+    "holdersWithLimit/BITCOIN/": (200, {}),
+    ALIASES_URL: (200, {}),
+    "info:spotMeta": (200, SPOT_TOKENS),
+}
+
+
+def test_help_explains_addresses_and_token_names():  # U6
+    run = BotRun().send("/help")
+    no_errors(run)
+    text = sent_text(run)
+    for part in (
+        "/register_alias",  # Still the list of commands
+        "Finding wallet addresses",
+        "leaderboard",
+        "/search_alias",
+        "UBTC",
+        "Unit Bitcoin",
+        "Perps (futures)",
+        "alias,address",
+    ):
+        assert part in text, part
+
+
+def test_welcome_and_menu_point_to_help():  # U6
+    run = started(BotRun().send("/start"))
+    welcome = run.telegram.texts()[0]
+    assert "/help" in welcome and "wallet addresses" in welcome
+    sent = [p for e, p in run.telegram.calls if e == "setMyCommands"]
+    assert "how to find addresses and token names" in str(sent[0]), sent
+
+
+def test_unknown_token_suggests_spot_names_as_buttons():  # U7
+    run = BotRun(NO_BTC).send("/get_top_holders", "btc")
+    no_errors(run)
+    asked = run.telegram.calls[-1][1]
+    assert "No token called <b>BTC</b>" in asked["text"]
+    assert "tk:UBTC" in str(asked["reply_markup"])
+    assert "UBTC (Unit Bitcoin)" in str(asked["reply_markup"])
+    run.send(("tap", "tk:UBTC"))  # Nothing happens on its own: the user picks it
+    no_errors(run)
+    assert "Top UBTC Holders" in sent_text(run)
+
+
+def test_full_names_find_spot_tokens_too():  # U7
+    run = BotRun(NO_BTC).send("/get_top_holders", "bitcoin")
+    no_errors(run)
+    assert "tk:UBTC" in str(run.telegram.calls[-1][1]["reply_markup"])
+
+
+def test_questions_point_to_help():  # U8
+    asked = BotRun().send("/get_top_holders").telegram.texts()[-1]
+    assert "UBTC" in asked and "/help" in asked
+    assert "/help" in BotRun().send("/register_alias").telegram.texts()[-1]
+    run = BotRun(saved_user_data={"aliases": {"zz-whale": WALLET}}).send("/wallet")
+    assert "/help" in run.telegram.texts()[-1]
+
+
+def test_help_during_a_question_keeps_the_question_open():  # U8
+    run = BotRun().send("/register_alias", "/help", ADDR)
+    no_errors(run)
+    assert "name this address" in run.telegram.texts()[-1]
+
+
+def test_messages_are_not_printed_in_the_terminal():  # U11
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        BotRun().send("zz-private words")
+    assert "zz-private words" not in out.getvalue(), out.getvalue()
+
+
+def test_log_lines_show_names_and_searches_safely():  # U11
+    # Names and typed text come from users: control codes could change your terminal,
+    # and a line break could fake a line of the log
+    out = io.StringIO()
+    routes = {HOLDERS: (200, {}), "info:spotMeta": (200, SPOT_META)}
+    with (
+        contextlib.redirect_stdout(out),
+        mock.patch.dict(harness.USER, first_name="zz-\x1b]0;x\x07Evil\nName"),
+    ):
+        BotRun(routes).send("/get_top_holders", "zz\x1b[2J" + "q" * 100)
+    lines = out.getvalue().splitlines()
+    assert lines and not any("\x1b" in line or "\x07" in line for line in lines), lines
+    assert any("Evil Name is searching for top holders" in line for line in lines), (
+        lines
+    )
+    assert all(len(line) < 200 for line in lines), lines
+
+
+def test_unknown_text_and_commands_get_one_hint_a_minute():  # U11
+    run = BotRun()
+    with mock.patch.object(run.module, "now", lambda: LATER):
+        run.send("zz-1", "zz-2", "zz-3", "/zz_a", "/zz_b")
+    texts = run.telegram.texts()
+    assert sum("Send /start" in t for t in texts) == 1, texts
+    assert sum("don't know that command" in t for t in texts) == 1, texts
+    with mock.patch.object(run.module, "now", lambda: LATER + 61):
+        run.send("zz-4")
+    assert sum("Send /start" in t for t in run.telegram.texts()) == 2
