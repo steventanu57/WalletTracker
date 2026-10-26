@@ -1,0 +1,30 @@
+# Personal settings and secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Bot data saved at runtime (contains users' saved aliases)
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# AI assistant / agent instruction files (personal, may contain private notes)
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+AGENTS.md
+GEMINI.md
+.cursor/
+.cursorrules
+.windsurfrules
+.github/copilot-instructions.md
+
+# Private notes: name them *.private.md or *.local.md to keep them out of git
+*.private.md
+*.local.md
